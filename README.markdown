@@ -1,6 +1,6 @@
-# An introduction to distributed systems
+# An Introduction to Distributed Systems
 
-Copyright 2014, 2016, 2017 Kyle Kingsbury; Jepsen, LLC.
+Copyright 2014--2020 Kyle Kingsbury; Jepsen, LLC.
 
 This outline accompanies a 12-16 hour [overview class on distributed systems
 fundamentals](http://jepsen.io/training.html). The course aims to introduce
@@ -257,7 +257,9 @@ Lamport, 1987:
 - More expensive than you'd like
   - Several hundred per GPS receiver
   - Atomic clocks for local corroboration: $$$$?
-  - Need multiple types of GPS: vendors can get it wrong
+  - Probably want multiple types of GPS clock
+    - https://rachelbythebay.com/w/2015/09/07/noleap/
+      - Confusing vendor checkbox which applied UTC corrections to GPS time
   - I don't know who's doing it yet, but I'd bet datacenters in the
     future will offer dedicated HW interfaces for bounded-accuracy time.
 
@@ -431,7 +433,7 @@ discuss some high-level *properties* of distributed systems.
     - Concurrent withdrawals were improperly isolated, allowing users to overspend
     - Safety audits didn't notice negative balances
     - 12.3% of exchange funds stolen; loss spread among users
-  - [Warszawski & Bailis 2017: Acidrain](http://www.bailis.org/papers/acidrain-sigmod2017.pdf)
+  - [Warszawski & Bailis 2017: ACIDRain](http://www.bailis.org/papers/acidrain-sigmod2017.pdf)
     - Automated identification of consistency violation in web apps
     - e.g. Buy one gift card, then spend it an unlimited number of times
     - e.g. Buy a pen, add a laptop to cart during checkout, get a free laptop
@@ -439,6 +441,10 @@ discuss some high-level *properties* of distributed systems.
       - Weak DB isolation defaults
       - Improper use of transactional scope
       - Failing to use any transactions whatsoever
+  - [Chase Bank's credit card rewards system](https://chadscira.com/post/5fa269d46142ac544e013d6e/DISCLOSURE-Unlimited-Chase-Ultimate-Rewards-Points)
+    - Concurrent transfers between balances allowed the creation of $70,000 USD
+      in travel vouchers.
+    - Redeemable for cash!
 
 ## Tradeoffs
 
@@ -577,6 +583,7 @@ consistency.
 - Unlike sequentially consistent systems, no "single source of truth"
 - But unlike naive eventually consistent systems, never *lose* information
   - Unless you explicitly make them lose information
+  - We call this property "coalescence"
 - Works well in highly-available systems
   - Web/mobile clients
   - Dynamo
@@ -739,6 +746,55 @@ consistency.
   - RethinkDB
   - etcd
   - Consul
+
+## What About Transactions?
+
+- Iterated consensus gives us agreement on a single total order of operations
+- Unnecessary blocking betwixt transactions which *could* execute independently
+- How do we improve performance?
+- [Distributed Transaction Architectures](https://aphyr.com/media/talks/2019/distributed-transaction-architectures.pdf)
+- Single-writer
+  - All updates go through a single queue, readers execute on snapshots
+  - Usually involves some kind of persistent data structure
+  - Serializable to strict-1SR
+  - See [Datomic](https://docs.datomic.com/on-prem/architecture.html)
+- OK but multiple writers?
+  - In general, have several shards, each running a consensus-backed FSM
+  - Some kind of protocol for cross-shard txns
+- Independent shards
+  - A sort of halfway-step to general-purpose transactions
+  - Disallow cross-shard txns
+  - Just run a bunch of independent consensus FSMs
+  - Can add a single global consensus group for cross-shard transactions
+    - Limited throughput though!
+  - See [VoltDB](https://docs.voltdb.com/UsingVoltDB/IntroHowVoltDBWorks.php)
+- [Percolator](https://storage.googleapis.com/pub-tools-public-publication-data/pdf/36726.pdf)
+  - Snapshot isolation over linearizable shards
+  - Time Stamp Oracle assigns sequential txn timestamps (using consensus)
+  - Read timestamp, read from leaders, prewrite, commit timestamp, commit, finalize
+  - 14 network hops, potentially all cross-DC
+  - See [TiDB](https://tikv.org/deep-dive/distributed-transaction/percolator/)
+- [Spanner](https://static.googleusercontent.com/media/research.google.com/en//archive/spanner-osdi2012.pdf)
+  - "External consistency" (strict-1SR?)
+  - Speed up timestamp assignment by using GPS+Atomic clocks
+  - Basically 2PC over Paxos groups
+    - Locks on Paxos leaders
+    - Pick one Paxos group to serve as the commit record for entire txn
+  - Fixed latency floor to ensure timestamp monotonicity
+  - See [Yugabyte DB](https://blog.yugabyte.com/distributed-postgresql-on-a-google-spanner-architecture-storage-layer/)
+  - See [CockroachDB](https://www.cockroachlabs.com/guides/cockroachdb-the-resilient-geo-distributed-sql-database-sigmod-2020/)
+- [Calvin](http://cs.yale.edu/homes/thomson/publications/calvin-sigmod12.pdf)
+  - Order transactions in a log using consensus
+  - Shard log for arbitrarily high throughput
+  - Periodically seal log windows and apply transactions to shards
+  - Application requires no communication!
+  - Strict-1SR
+  - 1 inter-DC round trip, more hops for local comms
+  - Scalable throughput
+  - Minimum latency floor
+  - Txns must be pure, expressed up-front
+    - Could be made interactive with extensions to protocol
+  - See [Fauna](https://fauna.com/)
 
 ## Review
 
@@ -1023,6 +1079,35 @@ than the *transformations*.
   - Consciously choosing to recover *above* the level of the system
   - This is how financial companies and retailers do it!
 
+### Recovery First
+
+- Assume a failure has just occurred: how will you recover?
+- Make this recovery the *default* path of execution
+- Writing recovery-first code keeps you from punting on error handling
+- Exercising recovery code by default means you know it works
+- Recovery by default means you don't have to worry about different semantics
+  during a real fault
+- If necessary, introduce a happy path for performance optimization
+  - But you lose some of these advantages!
+
+### Reconciliation Loops
+
+- You've got a complex, stateful system, and want to move it somewhere
+- Could devise a plan of changes, and apply those changes in order
+  - But what if some change breaks? How do you recover?
+- Instead, maintain a *target*: a representation of what you *want* the system
+  to become
+- Next, write a function that looks at the current state, and *diffs* it with
+  the target
+- Use that diff to find a step that moves the system closer to the target
+- Repeat indefinitely
+- Robust to faults and interference
+  - What if your admin is tweaking things by hand?
+  - What if two instances of the control system are running concurrently?
+- Deployed to great effect in systems like [Borg & Kubernetes](https://queue.acm.org/detail.cfm?id=2898444)
+- Also applicable to keeping data in sync between systems
+  - Making sure every order is shipped & billed, for instance
+
 ### Backups
 
 - Backups are essentially sequential consistency, BUT you lose a window of ops.
@@ -1229,14 +1314,6 @@ than the *transformations*.
   - Services should encapsulate and abstract
     - Try to build trees instead of webs
     - Avoid having outsiders manipulate a service's data store directly
-  - Coordination between services requires special protocols
-    - Have to re-invent transactions
-    - Go commutative where possible
-    - Sagas
-      - Was written for a single-node world: we have to be clever in distributed contexts
-      - Transactions must be idempotent, OR commute with rollbacks
-    - [Typhon/Cerberus](http://www.cs.ucsb.edu/~vaibhavarora/Typhon-Ieee-Cloud-2017.pdf)
-      - Protocol for causal consistency over multiple data stores
 
 ### Structure Follows Social Spaces
 
@@ -1252,7 +1329,7 @@ than the *transformations*.
   - So too will services and their boundaries
   - Gradually accruing body of assumptions about service relation to the world
   - Punctuated by rewrites to respond to changing external pressures
-  - Tushman & Romanelli, 1985: Organizational Evolution
+  - Tushman & Romanelli, 1985: Organizational Transformation as Punctuated Equilibrium
 - Services can be libraries
   - Initially, *all* your services should be libraries
   - Perfectly OK to depend on a user library in multiple services
@@ -1286,6 +1363,153 @@ than the *transformations*.
     - When the API is known to be stable, every client can *assume* it works
     - Removes the need for network calls in test suites
     - Dramatic reduction in test runtime and dev environment complexity
+
+### Cross-service coordination
+
+- Coordination between services requires special protocols
+  - Have to re-invent transactions
+  - Go commutative where possible
+  - Sagas
+    - Was written for a single-node world: we have to be clever in distributed contexts
+    - Transactions must be idempotent, OR commute with rollbacks
+  - [Typhon/Cerberus](http://www.cs.ucsb.edu/~vaibhavarora/Typhon-Ieee-Cloud-2017.pdf)
+    - Protocols for causal consistency over multiple data stores
+      - e.g. If Lupita blocks Miss Angela, then posts, Miss Angela can't see it
+    - Typhon: A single logical *entity* has *data item* representations in
+              different data stores
+      - Assumes datastores are serializable or offer atomic read/cas on items
+      - Transactions which access same entity AND T1 happens-before T2 get a
+        causal dependency edge T1 -> T2
+    - Cerberus: protocol for transactions involving a single entity x
+      - Writes can only affect one representation of x
+      - Any number of reads across representations of x
+      - Global metadata: a version vector for each entity (GVV)
+      - Each representation metadata:
+        - Update version vector (UVV): versions known as of last update
+        - Read version vector (RVV): versions known as of last read
+      - Conflicts detected when GVV < UVV/RVV
+      - Two phases:
+        - Reads
+          - Check GVV for entity x
+          - Perform reads of x on each (asked-for) representation
+          - At each representation: check RVV <= GVV, update RVV
+        - Writes
+          - Send write to representation
+          - Check UVV <= GVV & RVV <= GVV
+        - Commit
+          - Update representation and RVV/UVV ensuring RVV/UVV unchanged
+          - New UVV constructed by incrementing i'th entry of existing UVV
+  - General-purpose transactions
+    - [Calvin](http://cs.yale.edu/homes/thomson/publications/calvin-sigmod12.pdf)
+      - Serializable (or strict-1SR) transactions
+      - Deterministic txns enqueued into sharded global log
+      - Log ensures txn order
+      - Application at replicas/shards requires no further coordination
+      - Minimum latency floor for log windows
+    - [CockroachDB](https://www.cockroachlabs.com/guides/cockroachdb-the-resilient-geo-distributed-sql-database-sigmod-2020/)
+      - Serializable
+      - Assumes linearizable stores
+      - Assumes semi-sync clocks
+      - Similar to a more tractable Spanner
+
+### Migrations
+
+- Migrations are hard.
+  - There's no silver bullet
+  - But some techniques can make your life easier
+- Hard cut
+  - Write new system and migration to copy old data to it
+  - Have dependent services talk to both--but in practice, only one.
+  - Turn off old system
+  - Copy data
+  - Start up new system
+  - Tradeoffs!
+    - Don't have to worry about in-flight data
+    - Simple migration scripts: just read all data and write to new datastore
+    - Requires downtime proportional to migration script
+  - Can sometimes scope this to a single shard/user/domain at a time
+- Incremental
+  - Write new system B
+  - Deploy alongside original A
+  - Dependent services talk to both
+    - Ideal: find all readers, have every reader talk to both A and B
+    - Then start writing to B
+      - This frees you from having to worry about readers who only know about A
+  - Consistency nightmares; need to trace all data dependencies
+  - Tradeoffs!
+    - Reduced/no downtime
+    - But complex reasoning about data dependencies required
+- Wrapper services
+  - Operationally speaking, it can be tricky to FIND and change all users of A
+  - So... don't. Introduce a wrapper service W which proxies to A
+  - Introduce B, and make changes so that W talks to B as well
+  - When A is phased out, remove W and talk directly to B.
+  - Allows for centralized metrics, errors, comparison of behavior, etc
+- Eventual atomicity
+  - Imagine you write each update to old service A, then new service B
+  - At some point, your write to A will succeed, and B will fail. What then?
+  - Can use read-repair: read A and B, fill in missing updates
+    - But this requires mergeability: only works for things like CRDTs
+  - Can use a reconciliation process
+    - Iterate over whole DB, look for changes, apply to both.
+    - Also requires something like a CRDT
+  - Can use a Saga
+    - All updates go to durable queue
+    - Queue worker retries until updates applied to A and B
+    - Might require ordering updates to avoid state divergence
+      - Potentially *global* serialization
+    - Be aware of the DB's consistency model
+- Isolation
+  - Imagine Jane writes w1 to A, then B
+  - Concurrently, Naomi writes w2 to B, then A
+  - Result: A = w2, B = w1
+  - Eventual atomicity isn't enough to prevent divergence
+  - Can reduce issues by picking a standard order: always A then B (or B then A)
+    - But imagine
+      - Jane writes A = w1
+      - Naomi writes A = w2
+      - Naomi writes B = w2
+      - Jane writes B = w1
+    - We've got a mixed result again. Shoot.
+  - Can mitigate using CRDTs
+  - Or, if A and B are sequentially consistent, can use a CaS operation to
+    ensure agreement on order
+    - "Write w2 iff the last write was w1"
+  - If operations affect multiple keys, the CaS logic has to be applied at that
+  level too
+- Helpful properties for incremental migrations
+  - Determinism
+    - Avoid having the DB generate random numbers, automatic IDs, timestamps
+    - Easier to apply updates to two datastores and get the same results
+  - Idempotence
+    - Lets you retry updates freely
+  - Commutativity
+    - Removes the need for serializing updates
+  - CRDTs: associativity, commutativity, idempotence.
+  - Immutability: trivial CRDTs
+  - Statelessness: no state to worry about!
+    - Just make sure you talk to external stateful stuff the same way
+- What about swapping out queues?
+  - As we've touched, queue systems should already be designed for idempotency,
+    and ideally commutativity
+    - If so, this is (relatively) easy
+    - Workers consume from both queues
+    - Flip producers to send messages only to the new queue
+    - Wait for old queue to be exhausted
+    - Decommission old queue
+  - But we WANTED order???
+    - You're going to need to reconstruct it
+    - One option: single producer tightly coupled to queue
+      - Writes each message m to both A and B; doesn't move on until both ack
+      - This enforces that both A and B agree on order
+      - Consumers can treat A and B identically: consume just from A or B
+        - Again, assumes idempotence!
+    - Another option: sequence numbers, order reconstructed at client
+      - e.g. assign sequence numbers to each value
+        - Use the queue offsets from A?
+        - Use a consensus system?
+      - Clients read sequence numbers, store in internal buffer, apply in order
+
 
 ### Review
 
@@ -1507,6 +1731,8 @@ hand-in-hand with teams.
   - No node has unbounded memory. Your queues *must* be bounded
   - But how big? Nobody knows
   - Instrument your queues in prod to find out
+- Little's Law: mean queue depth = mean arrival rate * mean latency
+  - This is distribution-independent!
 - Queues exist to smooth out fluctuations in load
   - Improves throughput at expense of latency
   - If your load is higher than capacity, no queue will save you
@@ -1541,7 +1767,12 @@ special care.
 - Jeff Hodges has some excellent, production-focused advice. https://www.somethingsimilar.com/2013/01/14/notes-on-distributed-systems-for-young-bloods/
 - The Fallacies of Distributed Computing is a classic text on mistaken assumptions we make designing distributed systems. http://www.rgoarchitects.com/Files/fallacies.pdf
 - Christopher Meiklejohn has a list of key papers in distributed systems. http://christophermeiklejohn.com/distributed/systems/2013/07/12/readings-in-distributed-systems.html
+- Dan Creswell has a lovely reading list. https://dancres.github.io/Pages/
 
 ### Trees
 
-- Nancy Lynch's "Distributed Algorithms" is a comprehensive overview of the field from a more theoretical perspective
+- Martin Kleppmann's [Designing Data-Intensive
+  Applications](https://dataintensive.net/) offers a thorough tour of
+  distributed systems for practitioners.
+- Nancy Lynch's "Distributed Algorithms" is a comprehensive overview of the
+  field from a more theoretical perspective
